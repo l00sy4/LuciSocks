@@ -283,9 +283,10 @@ async fn main() {
 }
 
 async fn serve_os(addr: SocketAddr, creds: Creds) {
-    let listener = TcpListener::bind(addr)
-        .await
-        .unwrap_or_else(|e| panic!("Failed to start listening on {addr}: {e}"));
+    let Ok(listener) = TcpListener::bind(addr).await else {
+        return;
+    };
+
     loop {
         match listener.accept().await {
             Ok((socket, _)) => {
@@ -299,16 +300,17 @@ async fn serve_os(addr: SocketAddr, creds: Creds) {
 }
 
 async fn serve_tailnet(auth_key: &'static str, port: u16, creds: Creds) {
-    let dev = Device::new(&Config::default(), Some(auth_key.to_string()))
-        .await
-        .expect("failed to bring up tailscale device (is TS_RS_EXPERIMENT set?)");
-    let dev = Arc::new(dev);
+    let Ok(dev) = Device::new(&Config::default(), Some(auth_key.to_string())).await else {
+        return;
+    };
 
-    let ip = dev.ipv4_addr().await.expect("no tailnet IPv4 address");
-    let listener = dev
-        .tcp_listen((ip, port).into())
-        .await
-        .expect("failed to bind tailnet TCP listener");
+    let dev = Arc::new(dev);
+    let Ok(ip) = dev.ipv4_addr().await else {
+        return;
+    };
+    let Ok(listener) = dev.tcp_listen((ip, port).into()).await else {
+        return;
+    };
 
     let net = Net::Tailnet(dev);
     loop {
@@ -345,10 +347,7 @@ async fn validate_password(socket: &mut Stream, expect: [u8; 32]) -> std::io::Re
     socket.read_exact(&mut head).await?;
     let [version, ulen] = head;
     if version != USERPASS_VERSION {
-        return Err(Error::new(
-            ErrorKind::Unsupported,
-            "Unsupported userpass version",
-        ));
+        return Err(Error::from(ErrorKind::Unsupported));
     }
 
     let ulen = ulen as usize;
@@ -373,10 +372,7 @@ async fn validate_password(socket: &mut Stream, expect: [u8; 32]) -> std::io::Re
     if ok {
         Ok(())
     } else {
-        Err(Error::new(
-            ErrorKind::PermissionDenied,
-            "Authentication failed",
-        ))
+        Err(Error::from(ErrorKind::PermissionDenied))
     }
 }
 
@@ -403,12 +399,9 @@ async fn read_target(socket: &mut Stream, atyp: u8) -> std::io::Result<SocketAdd
             lookup_host((host.as_ref(), u16::from_be_bytes([*p0, *p1])))
                 .await?
                 .next()
-                .ok_or_else(|| Error::other("could not resolve host"))
+                .ok_or_else(|| Error::from(ErrorKind::HostUnreachable))
         }
-        _ => Err(Error::new(
-            ErrorKind::Unsupported,
-            "Unsupported address type",
-        )),
+        _ => Err(Error::from(ErrorKind::Unsupported)),
     }
 }
 
@@ -623,15 +616,10 @@ async fn handle_udp_associate(
 
 async fn handle_socks5(mut socket: Stream, net: Net, creds: Creds) -> std::io::Result<()> {
     let mut header = [0u8; 2];
-    if socket.read_exact(&mut header).await.is_err() {
-        return Ok(());
-    }
+    socket.read_exact(&mut header).await?;
     let [version, nmethods] = header;
     if version != SOCKS_VERSION {
-        return Err(Error::new(
-            ErrorKind::Unsupported,
-            "Unsupported SOCKS version",
-        ));
+        return Err(Error::from(ErrorKind::Unsupported));
     }
 
     let mut methods = [0u8; 255];
@@ -656,10 +644,7 @@ async fn handle_socks5(mut socket: Stream, net: Net, creds: Creds) -> std::io::R
     socket.read_exact(&mut head).await?;
     let [version, cmd, _rsv, atyp] = head;
     if version != SOCKS_VERSION {
-        return Err(Error::new(
-            ErrorKind::Unsupported,
-            "Unsupported SOCKS version",
-        ));
+        return Err(Error::from(ErrorKind::Unsupported));
     }
 
     let target: SocketAddr = read_target(&mut socket, atyp).await?;
@@ -669,10 +654,7 @@ async fn handle_socks5(mut socket: Stream, net: Net, creds: Creds) -> std::io::R
         CMD_BIND => handle_bind(socket, target.ip(), net).await?,
         CMD_UDP_ASSOCIATE => handle_udp_associate(socket, target, net).await?,
         _ => {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                "Unsupported SOCKS command",
-            ));
+            return Err(Error::from(ErrorKind::Unsupported));
         }
     }
 
