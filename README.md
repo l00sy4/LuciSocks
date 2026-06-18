@@ -1,6 +1,6 @@
 # LuciSocks
 
-LuciSocks is SOCKS5 server that can also bind on a Tailnet IP.
+LuciSocks is performant SOCKS5 server that can also bind on a Tailnet IP.
 
 ### Usage
 
