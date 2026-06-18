@@ -1,13 +1,16 @@
+use sha2::{Digest, Sha256};
 use std::{
-    env,
     io::{Error, ErrorKind},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
 };
+use tailscale::{Config, Device, netstack};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream, UdpSocket, lookup_host},
-    sync::Semaphore,
 };
 
 const SOCKS_VERSION: u8 = 0x05;
@@ -32,9 +35,37 @@ const REP_NETWORK_UNREACHABLE: u8 = 0x03;
 const REP_HOST_UNREACHABLE: u8 = 0x04;
 const REP_CONNECTION_REFUSED: u8 = 0x05;
 
-const MAX_CLIENTS: usize = 128;
 const RELAY_BUF: usize = 64 << 10;
 const UDP_BUF: usize = 65_535;
+
+type Creds = Option<[u8; 32]>;
+
+enum Entry {
+    Os {
+        addr: &'static str,
+        creds: Creds,
+    },
+    Tailnet {
+        auth_key: &'static str,
+        port: u16,
+        creds: Creds,
+    },
+}
+
+const CONFIG: &[Entry] = &[
+    Entry::Os {
+        addr: "127.0.0.1:1338",
+        creds: Some([
+            0x05, 0xD4, 0x96, 0x92, 0xB7, 0x55, 0xF9, 0x9C, 0x45, 0x04, 0xB5, 0x10, 0x41, 0x8E,
+            0xFE, 0xEE, 0xEB, 0xFD, 0x46, 0x68, 0x92, 0x54, 0x0F, 0x27, 0xAC, 0xF9, 0xA3, 0x1A,
+            0x32, 0x6D, 0x65, 0x04,
+        ]),
+    },
+    Entry::Os {
+        addr: "127.0.0.25:1330",
+        creds: None,
+    },
+];
 
 fn reply_for_error(e: &std::io::Error) -> u8 {
     match e.kind() {
@@ -46,44 +77,204 @@ fn reply_for_error(e: &std::io::Error) -> u8 {
     }
 }
 
+fn io_err<E: std::fmt::Display>(e: E) -> Error {
+    Error::other(e.to_string())
+}
+
+#[derive(Clone)]
+enum Net {
+    Os,
+    Tailnet(Arc<Device>),
+}
+
+impl Net {
+    async fn tcp_connect(&self, target: SocketAddr) -> std::io::Result<Stream> {
+        match self {
+            Net::Os => Ok(Stream::Os(TcpStream::connect(target).await?)),
+            Net::Tailnet(d) => Ok(Stream::Ts(d.tcp_connect(target).await.map_err(io_err)?)),
+        }
+    }
+
+    async fn tcp_listen(&self, addr: SocketAddr) -> std::io::Result<Listener> {
+        match self {
+            Net::Os => Ok(Listener::Os(TcpListener::bind(addr).await?)),
+            Net::Tailnet(d) => Ok(Listener::Ts(d.tcp_listen(addr).await.map_err(io_err)?)),
+        }
+    }
+
+    async fn udp_bind(&self, addr: SocketAddr) -> std::io::Result<Udp> {
+        match self {
+            Net::Os => Ok(Udp::Os(UdpSocket::bind(addr).await?)),
+            Net::Tailnet(d) => Ok(Udp::Ts(d.udp_bind(addr).await.map_err(io_err)?)),
+        }
+    }
+
+    async fn outbound_addr(&self, v6: bool) -> std::io::Result<SocketAddr> {
+        match self {
+            Net::Os => Ok(if v6 {
+                (Ipv6Addr::UNSPECIFIED, 0).into()
+            } else {
+                (Ipv4Addr::UNSPECIFIED, 0).into()
+            }),
+            Net::Tailnet(d) => {
+                let ip: IpAddr = if v6 {
+                    d.ipv6_addr().await.map_err(io_err)?.into()
+                } else {
+                    d.ipv4_addr().await.map_err(io_err)?.into()
+                };
+                Ok((ip, 0).into())
+            }
+        }
+    }
+}
+
+enum Stream {
+    Os(TcpStream),
+    Ts(netstack::TcpStream),
+}
+
+impl Stream {
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Stream::Os(s) => s.local_addr(),
+            Stream::Ts(s) => Ok(s.local_addr()),
+        }
+    }
+
+    fn set_nodelay(&self, on: bool) {
+        if let Stream::Os(s) = self {
+            let _ = s.set_nodelay(on);
+        }
+    }
+}
+
+impl AsyncRead for Stream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Stream::Os(s) => Pin::new(s).poll_read(cx, buf),
+            Stream::Ts(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Stream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Stream::Os(s) => Pin::new(s).poll_write(cx, buf),
+            Stream::Ts(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Stream::Os(s) => Pin::new(s).poll_flush(cx),
+            Stream::Ts(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Stream::Os(s) => Pin::new(s).poll_shutdown(cx),
+            Stream::Ts(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+enum Listener {
+    Os(TcpListener),
+    Ts(netstack::TcpListener),
+}
+
+impl Listener {
+    async fn accept(&self) -> std::io::Result<(Stream, SocketAddr)> {
+        match self {
+            Listener::Os(l) => {
+                let (s, a) = l.accept().await?;
+                Ok((Stream::Os(s), a))
+            }
+            Listener::Ts(l) => {
+                let s = l.accept().await.map_err(io_err)?;
+                let peer = s.remote_addr();
+                Ok((Stream::Ts(s), peer))
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Listener::Os(l) => l.local_addr(),
+            Listener::Ts(l) => Ok(l.local_addr()),
+        }
+    }
+}
+
+enum Udp {
+    Os(UdpSocket),
+    Ts(netstack::UdpSocket),
+}
+
+impl Udp {
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        match self {
+            Udp::Os(s) => s.recv_from(buf).await,
+            Udp::Ts(s) => s
+                .recv_from(buf)
+                .await
+                .map(|(addr, n)| (n, addr))
+                .map_err(io_err),
+        }
+    }
+
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        match self {
+            Udp::Os(s) => s.send_to(buf, target).await,
+            Udp::Ts(s) => s
+                .send_to(target, buf)
+                .await
+                .map(|()| buf.len())
+                .map_err(io_err),
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Udp::Os(s) => s.local_addr(),
+            Udp::Ts(s) => Ok(s.local_addr()),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    let addresses: Vec<SocketAddr> = env::args()
-        .skip(1)
-        .map(|s| {
-            s.parse()
-                .expect("Please specify at least one valid IPv4 or IPv6 address")
-        })
-        .collect();
+    unsafe {
+        std::env::set_var("TS_RS_EXPERIMENT", "this_is_unstable_software");
+    }
 
     let mut handles = Vec::new();
-    for addr in addresses {
-        let listener = TcpListener::bind(addr)
-            .await
-            .unwrap_or_else(|e| panic!("Failed to start listening on {addr}: {e}"));
-
-        let semaphore = Arc::new(Semaphore::new(MAX_CLIENTS));
-        handles.push(tokio::spawn(async move {
-            loop {
-                let permit = semaphore
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("Semaphore closed");
-
-                match listener.accept().await {
-                    Ok((socket, _)) => {
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            let _ = handle_client(socket).await;
-                        });
-                    }
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                }
+    for entry in CONFIG {
+        match entry {
+            Entry::Os { addr, creds } => {
+                let addr: SocketAddr = addr.parse().unwrap();
+                let creds = *creds;
+                handles.push(tokio::spawn(serve_os(addr, creds)));
             }
-        }));
+            Entry::Tailnet {
+                auth_key,
+                port,
+                creds,
+            } => {
+                let (auth_key, port, creds) = (*auth_key, *port, *creds);
+                handles.push(tokio::spawn(serve_tailnet(auth_key, port, creds)));
+            }
+        }
     }
 
     for handle in handles {
@@ -91,22 +282,49 @@ async fn main() {
     }
 }
 
-async fn send_socks_reply(
-    socket: &mut TcpStream,
-    rep: u8,
-    bound: SocketAddr,
-) -> std::io::Result<()> {
-    //
-    // The server evaluates the request, and
-    // returns a reply formed as follows:
-    //
-    //        +----+-----+-------+------+----------+----------+
-    //        |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
-    //        +----+-----+-------+------+----------+----------+
-    //        | 1  |  1  | X'00' |  1   | Variable |    2     |
-    //        +----+-----+-------+------+----------+----------+
-    //
+async fn serve_os(addr: SocketAddr, creds: Creds) {
+    let listener = TcpListener::bind(addr)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to start listening on {addr}: {e}"));
+    loop {
+        match listener.accept().await {
+            Ok((socket, _)) => {
+                tokio::spawn(async move {
+                    let _ = handle_socks5(Stream::Os(socket), Net::Os, creds).await;
+                });
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
 
+async fn serve_tailnet(auth_key: &'static str, port: u16, creds: Creds) {
+    let dev = Device::new(&Config::default(), Some(auth_key.to_string()))
+        .await
+        .expect("failed to bring up tailscale device (is TS_RS_EXPERIMENT set?)");
+    let dev = Arc::new(dev);
+
+    let ip = dev.ipv4_addr().await.expect("no tailnet IPv4 address");
+    let listener = dev
+        .tcp_listen((ip, port).into())
+        .await
+        .expect("failed to bind tailnet TCP listener");
+
+    let net = Net::Tailnet(dev);
+    loop {
+        match listener.accept().await {
+            Ok(socket) => {
+                let net = net.clone();
+                tokio::spawn(async move {
+                    let _ = handle_socks5(Stream::Ts(socket), net, creds).await;
+                });
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
+async fn send_socks_reply(socket: &mut Stream, rep: u8, bound: SocketAddr) -> std::io::Result<()> {
     let mut msg = vec![SOCKS_VERSION, rep, 0x00];
     match bound.ip() {
         IpAddr::V4(ip) => {
@@ -122,22 +340,10 @@ async fn send_socks_reply(
     socket.write_all(&msg).await
 }
 
-async fn validate_password(socket: &mut TcpStream) -> std::io::Result<()> {
-    //
-    // This begins with the client producing a
-    // username/password request:
-    //
-    //           +----+------+----------+------+----------+
-    //           |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
-    //           +----+------+----------+------+----------+
-    //           | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
-    //           +----+------+----------+------+----------+
-    //
-
+async fn validate_password(socket: &mut Stream, expect: [u8; 32]) -> std::io::Result<()> {
     let mut head = [0u8; 2];
     socket.read_exact(&mut head).await?;
     let [version, ulen] = head;
-
     if version != USERPASS_VERSION {
         return Err(Error::new(
             ErrorKind::Unsupported,
@@ -155,17 +361,12 @@ async fn validate_password(socket: &mut TcpStream) -> std::io::Result<()> {
 
     let username = &user_buf[..ulen];
     let password = &pass_buf[..plen];
-    let ok = username == b"luci4" && password == b"rocks";
 
-    //
-    //  The server verifies the supplied UNAME and PASSWD, and sends the
-    //  following response:
-    //
-    //                   +----+--------+
-    //                   |VER | STATUS |
-    //                   +----+--------+
-    //                   | 1  |   1    |
-    //                   +----+--------+
+    let mut hasher = Sha256::new();
+    hasher.update(username);
+    hasher.update(password);
+    let digest = hasher.finalize();
+    let ok = digest.as_slice() == expect.as_slice();
 
     socket.write_all(&[USERPASS_VERSION, u8::from(!ok)]).await?;
 
@@ -179,7 +380,7 @@ async fn validate_password(socket: &mut TcpStream) -> std::io::Result<()> {
     }
 }
 
-async fn read_target(socket: &mut TcpStream, atyp: u8) -> std::io::Result<SocketAddr> {
+async fn read_target(socket: &mut Stream, atyp: u8) -> std::io::Result<SocketAddr> {
     match atyp {
         ATYP_V4 => {
             let mut ipv4 = [0u8; 6];
@@ -211,53 +412,35 @@ async fn read_target(socket: &mut TcpStream, atyp: u8) -> std::io::Result<Socket
     }
 }
 
-async fn handle_connect(mut client: TcpStream, target: SocketAddr) -> std::io::Result<()> {
-    let mut upstream = match TcpStream::connect(target).await {
+async fn handle_connect(mut client: Stream, target: SocketAddr, net: Net) -> std::io::Result<()> {
+    let mut upstream = match net.tcp_connect(target).await {
         Ok(s) => s,
         Err(e) => {
-            let rep = reply_for_error(&e);
-            send_socks_reply(&mut client, rep, target).await?;
+            send_socks_reply(&mut client, reply_for_error(&e), target).await?;
             return Ok(());
         }
     };
 
-    //
-    //  In the reply to a CONNECT, BND.PORT contains the port number that the
-    //  server assigned to connect to the target host, while BND.ADDR
-    //  contains the associated IP address
-    //
+    send_socks_reply(&mut client, REP_SUCCESS, upstream.local_addr()?).await?;
 
-    let bound = upstream.local_addr()?;
-    send_socks_reply(&mut client, REP_SUCCESS, bound).await?;
-
-    let _ = client.set_nodelay(true);
-    let _ = upstream.set_nodelay(true);
+    client.set_nodelay(true);
+    upstream.set_nodelay(true);
     tokio::io::copy_bidirectional_with_sizes(&mut client, &mut upstream, RELAY_BUF, RELAY_BUF)
         .await?;
     Ok(())
 }
 
-async fn handle_bind(mut client: TcpStream, expected: IpAddr) -> std::io::Result<()> {
+async fn handle_bind(mut client: Stream, expected: IpAddr, net: Net) -> std::io::Result<()> {
     let unspecified = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
 
-    //
-    // The first reply is sent after the server creates and binds a new socket
-    //
-
-    let listener = match TcpListener::bind((client.local_addr()?.ip(), 0)).await {
+    let listener = match net.tcp_listen((client.local_addr()?.ip(), 0).into()).await {
         Ok(l) => l,
         Err(e) => {
             send_socks_reply(&mut client, reply_for_error(&e), unspecified).await?;
             return Ok(());
         }
     };
-
     send_socks_reply(&mut client, REP_SUCCESS, listener.local_addr()?).await?;
-
-    //
-    // The second reply occurs only after the anticipated incoming connection
-    // succeeds or fails
-    //
 
     let (mut inbound, peer) = loop {
         let (stream, peer) = match listener.accept().await {
@@ -271,11 +454,10 @@ async fn handle_bind(mut client: TcpStream, expected: IpAddr) -> std::io::Result
             break (stream, peer);
         }
     };
-
     send_socks_reply(&mut client, REP_SUCCESS, peer).await?;
 
-    let _ = client.set_nodelay(true);
-    let _ = inbound.set_nodelay(true);
+    client.set_nodelay(true);
+    inbound.set_nodelay(true);
     tokio::io::copy_bidirectional(&mut client, &mut inbound).await?;
     Ok(())
 }
@@ -314,7 +496,7 @@ fn build_udp_header(src: SocketAddr, out: &mut Vec<u8>) {
 }
 
 async fn forward_to_client(
-    relay: &UdpSocket,
+    relay: &Udp,
     client: SocketAddr,
     src: SocketAddr,
     payload: &[u8],
@@ -384,18 +566,15 @@ fn parse_udp_header(buf: &[u8]) -> std::io::Result<(u8, UdpDest, usize)> {
 }
 
 async fn handle_udp_associate(
-    mut control: TcpStream,
+    mut control: Stream,
     requested: SocketAddr,
+    net: Net,
 ) -> std::io::Result<()> {
-    //
-    // Relay socket on the same interface the client reached us on
-    //
-
-    let relay = UdpSocket::bind((control.local_addr()?.ip(), 0)).await?;
+    let relay = net.udp_bind((control.local_addr()?.ip(), 0).into()).await?;
     send_socks_reply(&mut control, REP_SUCCESS, relay.local_addr()?).await?;
 
-    let out4 = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
-    let out6 = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).await?;
+    let out4 = net.udp_bind(net.outbound_addr(false).await?).await?;
+    let out6 = net.udp_bind(net.outbound_addr(true).await?).await?;
 
     let mut client: Option<SocketAddr> = None;
     let mut scratch = Vec::with_capacity(UDP_BUF);
@@ -431,12 +610,6 @@ async fn handle_udp_associate(
                     forward_to_client(&relay, c, src, &s6buf[..n], &mut scratch).await;
                 }
             }
-
-            //
-            //  A UDP association terminates when the TCP connection
-            //  that the UDP ASSOCIATE request arrived on terminates
-            //
-
             res = control.read(&mut ctlbuf) => {
                 if matches!(res, Ok(0) | Err(_)) {
                     break;
@@ -448,22 +621,12 @@ async fn handle_udp_associate(
     Ok(())
 }
 
-async fn handle_client(mut socket: TcpStream) -> std::io::Result<()> {
-    //
-    // Method selection message from the client:
-    //
-    //      +----+----------+----------+
-    //      |VER | NMETHODS | METHODS  |
-    //      +----+----------+----------+
-    //      | 1  |    1     | 1 to 255 |
-    //      +----+----------+----------+
-
+async fn handle_socks5(mut socket: Stream, net: Net, creds: Creds) -> std::io::Result<()> {
     let mut header = [0u8; 2];
     if socket.read_exact(&mut header).await.is_err() {
         return Ok(());
     }
     let [version, nmethods] = header;
-
     if version != SOCKS_VERSION {
         return Err(Error::new(
             ErrorKind::Unsupported,
@@ -475,45 +638,23 @@ async fn handle_client(mut socket: TcpStream) -> std::io::Result<()> {
     let methods = &mut methods[..nmethods as usize];
     socket.read_exact(methods).await?;
 
-    //
-    // No reason to support GSSAPI
-    //
+    let chosen = match creds {
+        Some(_) if methods.contains(&METHOD_USERPASS) => METHOD_USERPASS,
+        None if methods.contains(&METHOD_NO_AUTH) => METHOD_NO_AUTH,
+        _ => METHOD_NONE_ACCEPTABLE,
+    };
 
-    let chosen = [METHOD_USERPASS, METHOD_NO_AUTH]
-        .into_iter()
-        .find(|m| methods.contains(m))
-        .unwrap_or(METHOD_NONE_ACCEPTABLE);
+    socket.write_all(&[SOCKS_VERSION, chosen]).await?;
 
     match chosen {
-        METHOD_USERPASS => {
-            socket.write_all(&[SOCKS_VERSION, METHOD_USERPASS]).await?;
-            validate_password(&mut socket).await?;
-        }
-        METHOD_NO_AUTH => {
-            socket.write_all(&[SOCKS_VERSION, METHOD_NO_AUTH]).await?;
-        }
-        _ => {
-            socket
-                .write_all(&[SOCKS_VERSION, METHOD_NONE_ACCEPTABLE])
-                .await?;
-            return Ok(());
-        }
+        METHOD_NO_AUTH => {}
+        METHOD_USERPASS => validate_password(&mut socket, creds.unwrap()).await?,
+        _ => return Ok(()),
     }
-
-    //
-    //  The SOCKS request is formed as follows:
-    //
-    //        +----+-----+-------+------+----------+----------+
-    //        |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
-    //        +----+-----+-------+------+----------+----------+
-    //        | 1  |  1  | X'00' |  1   | Variable |    2     |
-    //        +----+-----+-------+------+----------+----------+
-    //
 
     let mut head = [0u8; 4];
     socket.read_exact(&mut head).await?;
     let [version, cmd, _rsv, atyp] = head;
-
     if version != SOCKS_VERSION {
         return Err(Error::new(
             ErrorKind::Unsupported,
@@ -524,9 +665,9 @@ async fn handle_client(mut socket: TcpStream) -> std::io::Result<()> {
     let target: SocketAddr = read_target(&mut socket, atyp).await?;
 
     match cmd {
-        CMD_CONNECT => handle_connect(socket, target).await?,
-        CMD_BIND => handle_bind(socket, target.ip()).await?,
-        CMD_UDP_ASSOCIATE => handle_udp_associate(socket, target).await?,
+        CMD_CONNECT => handle_connect(socket, target, net).await?,
+        CMD_BIND => handle_bind(socket, target.ip(), net).await?,
+        CMD_UDP_ASSOCIATE => handle_udp_associate(socket, target, net).await?,
         _ => {
             return Err(Error::new(
                 ErrorKind::Unsupported,
