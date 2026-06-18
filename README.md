@@ -4,7 +4,7 @@ LuciSocks is performant SOCKS5 server that can also bind on a Tailnet IP.
 
 ### Usage
 
-LuciSocks can listen on multiple interfaces, as specified in the hardcoded configuration. In the following example, LuciSocks is configured to listen on `127.0.0.1:1338` and to enforce username/password authentication. In this case, `creds` is the SHA-256 hash of the concatenation of the username and password. The config also instructs LuciSocks to listen on `10.10.1.25:1330`, but without any authentication. Finally, the `Tailnet` entry tells configures LuciSocks to bind port `2001` on the Tailnet IP address received after authenticating with the specified auth key.
+LuciSocks can listen on multiple interfaces, as specified in the hardcoded configuration. In the following example, LuciSocks is configured to listen on `127.0.0.1:1338` and to enforce username/password authentication. In this case, `creds` is the SHA-256 hash of the concatenation of the username and password. The config also instructs LuciSocks to listen on `10.10.1.25:1330`, but without any authentication. Finally, the `Tailnet` entry tells configures LuciSocks to bind port `2001` on the Tailnet IP address received after registering with the specified auth key.
 
 ```rust
 const CONFIG: &[Entry] = &[
