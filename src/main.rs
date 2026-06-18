@@ -467,7 +467,7 @@ impl UdpDest {
             UdpDest::Domain(host, port) => lookup_host((host.as_str(), port))
                 .await?
                 .next()
-                .ok_or_else(|| Error::other("could not resolve UDP destination")),
+                .ok_or_else(|| Error::from(ErrorKind::HostUnreachable)),
         }
     }
 }
@@ -514,7 +514,7 @@ fn accept_client(lock: &mut Option<SocketAddr>, requested: SocketAddr, src: Sock
 }
 
 fn parse_udp_header(buf: &[u8]) -> std::io::Result<(u8, UdpDest, usize)> {
-    let short = || Error::new(ErrorKind::InvalidData, "UDP datagram truncated");
+    let short = || Error::from(ErrorKind::InvalidData);
     if buf.len() < 4 {
         return Err(short());
     }
@@ -549,12 +549,12 @@ fn parse_udp_header(buf: &[u8]) -> std::io::Result<(u8, UdpDest, usize)> {
                 return Err(short());
             }
             let host = std::str::from_utf8(&buf[5..5 + dlen])
-                .map_err(|_| Error::new(ErrorKind::InvalidData, "Bad domain in UDP header"))?
+                .map_err(|_| Error::from(ErrorKind::InvalidData))?
                 .to_owned();
             let port = u16::from_be_bytes([buf[end - 2], buf[end - 1]]);
             Ok((frag, UdpDest::Domain(host, port), end))
         }
-        _ => Err(Error::new(ErrorKind::InvalidData, "Bad ATYP in UDP header")),
+        _ => Err(Error::from(ErrorKind::InvalidData)),
     }
 }
 
