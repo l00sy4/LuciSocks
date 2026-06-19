@@ -12,6 +12,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream, UdpSocket, lookup_host},
 };
+use url::Url;
 
 const SOCKS_VERSION: u8 = 0x05;
 const USERPASS_VERSION: u8 = 0x01;
@@ -49,6 +50,7 @@ enum Entry {
         auth_key: &'static str,
         port: u16,
         creds: Creds,
+        server_url: Option<&'static str>,
     },
 }
 
@@ -270,9 +272,12 @@ async fn main() {
                 auth_key,
                 port,
                 creds,
+                server_url,
             } => {
-                let (auth_key, port, creds) = (*auth_key, *port, *creds);
-                handles.push(tokio::spawn(serve_tailnet(auth_key, port, creds)));
+                let (auth_key, port, creds, server_url) = (*auth_key, *port, *creds, *server_url);
+                handles.push(tokio::spawn(serve_tailnet(
+                    auth_key, port, creds, server_url,
+                )));
             }
         }
     }
@@ -299,8 +304,19 @@ async fn serve_os(addr: SocketAddr, creds: Creds) {
     }
 }
 
-async fn serve_tailnet(auth_key: &'static str, port: u16, creds: Creds) {
-    let Ok(dev) = Device::new(&Config::default(), Some(auth_key.to_string())).await else {
+async fn serve_tailnet(
+    auth_key: &'static str,
+    port: u16,
+    creds: Creds,
+    server_url: Option<&'static str>,
+) {
+    let mut config = Config::default();
+
+    if let Some(server_url) = server_url {
+        config.control_server_url = Url::parse(server_url).unwrap();
+    }
+
+    let Ok(dev) = Device::new(&config, Some(auth_key.to_string())).await else {
         return;
     };
 
@@ -308,6 +324,7 @@ async fn serve_tailnet(auth_key: &'static str, port: u16, creds: Creds) {
     let Ok(ip) = dev.ipv4_addr().await else {
         return;
     };
+
     let Ok(listener) = dev.tcp_listen((ip, port).into()).await else {
         return;
     };
