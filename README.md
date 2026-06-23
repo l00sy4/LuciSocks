@@ -1,6 +1,6 @@
 # LuciSocks
 
-LuciSocks is performant SOCKS5 server that can also bind on a Tailnet IP.
+LuciSocks is performant SOCKS5 server that can also bind on a Tailnet IP. Tested on Windows 11.26200 and macOS 26.5.1 (25F80)
 
 ### Usage
 
