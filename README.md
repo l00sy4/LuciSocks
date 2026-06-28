@@ -4,7 +4,7 @@ LuciSocks is performant SOCKS5 server that can also bind on a Tailnet IP. Tested
 
 ### Usage
 
-LuciSocks can listen on multiple interfaces, as specified in the hardcoded configuration. In the following example, LuciSocks is configured to:
+The tool can listen on multiple interfaces, as specified in the hardcoded configuration. In the following example, LuciSocks is configured to:
 
 - Listen on `10.10.11.10:1338` and to enforce username/password authentication. In this case, `creds` is the SHA-256 hash of the concatenation of the username and password.
 - Listen on `[::1]:1330`, but without any authentication.
